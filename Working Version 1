@@ -1,0 +1,228 @@
+// =========================================================
+// 1. LOAD DATASETS
+// =========================================================
+var trainingData = ee.FeatureCollection('projects/esther-mainaesther77/assets/FieldData');
+var cropMask = ee.Image('projects/esther-mainaesther77/assets/cropmask24');
+
+var bufferArea = trainingData.geometry().buffer(5000);
+
+
+// =========================================================
+// 2. CROP CLASS MAPPING
+// =========================================================
+var cropClassMap = {
+  'Avocado': 1, 'Bananas': 2, 'Beans': 3, 'Coffee': 4, 'Macadamia': 5,
+  'Maize': 6, 'Mango': 7, 'Rice': 8, 'Sorghum': 9, 'Tea': 10, 'Others': 11
+};
+
+trainingData = trainingData.map(function(feature) {
+  var cropName = feature.get('Class');
+  var cropID = ee.Dictionary(cropClassMap).get(cropName, 11);
+  return feature.set('crop_type', ee.Number(cropID));
+});
+
+
+// =========================================================
+// 3. HYBRID CLOUD MASK (QA60 + s2Cloudless)
+// =========================================================
+
+// ---- 3.1 QA60 mask ----
+function maskQA60(img){
+  var qa = img.select('QA60');
+  var cloudBit = 1 << 10;
+  var cirrusBit = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBit).eq(0)
+               .and(qa.bitwiseAnd(cirrusBit).eq(0));
+  return img.updateMask(mask);
+}
+
+// ---- 3.2 Cloud probability mask ----
+var cloudProbCol = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY")
+  .filterBounds(bufferArea)
+  .filterDate('2024-10-01','2025-01-31');
+
+// ---- 3.3 Sentinel-2 SR ----
+var s2SrCol = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(bufferArea)
+  .filterDate('2024-10-01','2025-01-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',80));
+
+// ---- 3.4 Join S2 + Cloud Prob ----
+var joined = ee.Join.saveFirst('cloud_prob').apply({
+  primary: s2SrCol,
+  secondary: cloudProbCol,
+  condition: ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'})
+});
+
+// ---- 3.5 Hybrid mask function ----
+function maskCloudsHybrid(img){
+  img = ee.Image(img);
+  var cloudProb = ee.Image(img.get('cloud_prob'));
+
+  var probMask = cloudProb.lt(40);    // keep <40% cloud probability
+  img = img.updateMask(probMask);
+
+  img = maskQA60(img);                // combine with QA60 mask
+
+  return img;
+}
+
+
+// =========================================================
+// 4. ENHANCED INDEX FUNCTION (SAFE)
+// =========================================================
+function addIndices(img) {
+  img = ee.Image(img);   // ensure Image type
+
+  // Check bands and add missing SWIR if needed
+  var required = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'];
+  var imgBands = img.bandNames();
+
+  var outImg = img;
+  required.forEach(function(b){
+    outImg = ee.Image(ee.Algorithms.If(
+      imgBands.contains(b),
+      outImg,
+      outImg.addBands(ee.Image.constant(0).rename(b))
+    ));
+  });
+
+  var B = function(b){ return outImg.select(b); };
+
+  // Indices
+  var ndvi = B('B8').subtract(B('B4')).divide(B('B8').add(B('B4')).add(1e-9)).rename('NDVI');
+  var evi = ee.Image(2.5).multiply(B('B8').subtract(B('B4'))
+            .divide(B('B8').add(ee.Image(6).multiply(B('B4')))
+            .subtract(ee.Image(7.5).multiply(B('B2'))).add(1))).rename('EVI');
+  var ndwi = B('B3').subtract(B('B8')).divide(B('B3').add(B('B8')).add(1e-9)).rename('NDWI');
+  var ndmi = B('B8').subtract(B('B11')).divide(B('B8').add(B('B11')).add(1e-9)).rename('NDMI');
+  var nbr = B('B8').subtract(B('B12')).divide(B('B8').add(B('B12')).add(1e-9)).rename('NBR');
+  var savi = (B('B8').subtract(B('B4'))).divide(B('B8').add(B('B4')).add(0.5))
+             .multiply(1.5).rename('SAVI');
+  var gci = B('B8').divide(B('B3').add(1e-9)).subtract(1).rename('GCI');
+  var mcari = (B('B5').subtract(B('B4')).subtract(
+                ee.Image(0.2).multiply(B('B5').subtract(B('B3')))
+              )).multiply(B('B5').divide(B('B4').add(1e-9))).rename('MCARI');
+  var msi = B('B11').divide(B('B8').add(1e-9)).rename('MSI');
+  var ndre = B('B8').subtract(B('B5')).divide(B('B8').add(B('B5')).add(1e-9)).rename('NDRE');
+  var sr = B('B8').divide(B('B4').add(1e-9)).rename('SR');
+
+  var base = outImg.select(required);
+
+  var final = ee.Image(base).addBands([
+    ndvi, evi, ndwi, ndmi, nbr, savi, gci, mcari, msi, ndre, sr
+  ]);
+
+  return final.copyProperties(img, img.propertyNames());
+}
+
+
+// =========================================================
+// 5. APPLY MASK + INDICES SAFELY
+// =========================================================
+var s2Processed = ee.ImageCollection(joined).map(function(img){
+  img = ee.Image(img);
+  var masked = maskCloudsHybrid(img);
+  var indexed = addIndices(masked);
+  return ee.Image(indexed).clip(bufferArea);
+});
+
+// Build monthly composite
+var composite = s2Processed.median();
+
+
+// =========================================================
+// 6. PREPARE TRAINING DATA
+// =========================================================
+var trainingSample = composite.sampleRegions({
+  collection: trainingData,
+  properties: ['crop_type'],
+  scale: 10,
+  tileScale: 4
+});
+
+
+// =========================================================
+// 7. TRAIN CLASSIFIER
+// =========================================================
+var classifier = ee.Classifier.smileRandomForest(200)
+  .train({
+    features: trainingSample,
+    classProperty: 'crop_type',
+    inputProperties: composite.bandNames()
+  });
+
+
+// =========================================================
+// 8. CLASSIFICATION
+// =========================================================
+var classified = composite.classify(classifier)
+  .updateMask(cropMask)
+  .rename('classification');
+
+
+// =========================================================
+// 9. VISUALIZATION
+// =========================================================
+var visParams = {
+  min: 1,
+  max: 11,
+  palette: [
+    'FF0000','00FF00','0000FF','FFFF00','FF00FF','00FFFF',
+    '800000','808000','008000','800080','808080'
+  ]
+};
+
+Map.centerObject(trainingData, 12);
+Map.addLayer(classified, visParams, 'Crop Classification');
+
+
+// =========================================================
+// 10. LEGEND
+// =========================================================
+var legend = ui.Panel({
+  style: {position:'bottom-left', padding:'8px', backgroundColor:'white'}
+});
+legend.add(ui.Label({value:'Crop Type Legend', style:{fontWeight:'bold'}}));
+
+Object.keys(cropClassMap).forEach(function(cropName){
+  var idx = cropClassMap[cropName];
+  var colorBox = ui.Label({
+    style:{
+      backgroundColor: visParams.palette[idx - 1],
+      padding:'6px', margin:'2px', width:'20px'
+    }
+  });
+  var row = ui.Panel([colorBox, ui.Label(cropName)], ui.Panel.Layout.Flow('horizontal'));
+  legend.add(row);
+});
+
+Map.add(legend);
+
+
+// =========================================================
+// 11. EXPORTS
+// =========================================================
+var vectors = classified.reduceToVectors({
+  geometry: bufferArea,
+  geometryType: 'polygon',
+  reducer: ee.Reducer.countEvery(),
+  scale: 10,
+  maxPixels: 1e13
+}).map(function(f){
+  return f.set('crop_type', f.get('classification'));
+});
+
+Export.table.toDrive({
+  collection: vectors,
+  description: 'Crop_Classification_Vectors',
+  fileFormat: 'SHP'
+});
+
+Export.image.toDrive({
+  image: classified,
+  description: 'Crop_Classification',
+  scale: 10,
+  region: bufferArea,
+  maxPixels: 1e13
+});
